@@ -42,6 +42,7 @@ CONTAINER_NAME="${APP_NAME}-${DB_TYPE}"
 MYSQL_ROOT_PASSWORD="rootpass"
 DB_USER="appuser"
 DB_PASSWORD="apppass"
+CURRENT_DB_PASSWORD="currentpass"
 DB_NAME="appdb"
 EXPECTED_DB_VALUE="from_backup"
 EXPECTED_SENTINEL_VALUE="sentinel-before-backup"
@@ -52,14 +53,27 @@ ORIGINAL_COMPOSE_SHA=""
 ORIGINAL_SENTINEL_SHA=""
 ORIGINAL_PAYLOAD_SHA=""
 ORIGINAL_SQLITE_DUMP_SHA=""
+CURRENT_COMPOSE_SHA=""
 LATEST_BACKUP=""
 EXTRACTED_BACKUP_DIR=""
 COMBINED_BACKUP_ARCHIVE=""
 MULTIPART_SPLIT_SIZE_BYTES=2048
 MULTIPART_SPLIT_THRESHOLD_BYTES=3072
+SQLITE_HOLDER_PID=""
+SQLITE_HOLDER_READY="$WORK_DIR/sqlite-holder.ready"
+SQLITE_HOLDER_STOP="$WORK_DIR/sqlite-holder.stop"
+
+stop_sqlite_holder() {
+    if [ -n "$SQLITE_HOLDER_PID" ] && kill -0 "$SQLITE_HOLDER_PID" 2>/dev/null; then
+        touch "$SQLITE_HOLDER_STOP"
+        wait "$SQLITE_HOLDER_PID"
+    fi
+    SQLITE_HOLDER_PID=""
+}
 
 cleanup() {
     local exit_code=$?
+    stop_sqlite_holder
     if [ "$exit_code" -ne 0 ] && [ -d "$WORK_DIR" ]; then
         while IFS= read -r log_path; do
             [ -n "$log_path" ] || continue
@@ -176,10 +190,43 @@ write_common_files() {
     fi
 }
 
+write_stale_database_artifacts() {
+    case "$DB_TYPE" in
+    mysql)
+        printf '%s\n' \
+            '-- MySQL dump 10.13  Distrib 8.0, for Linux (x86_64)' \
+            'CREATE TABLE stale_from_previous_restore (id INT);' \
+            '-- Dump completed on 2000-01-01 00:00:00' >"$APP_DIR/db_backup.sql"
+        ;;
+    mariadb)
+        printf '%s\n' \
+            '-- MariaDB dump 10.19  Distrib 10.11, for debian-linux-gnu (x86_64)' \
+            'CREATE TABLE stale_from_previous_restore (id INT);' \
+            '-- Dump completed on 2000-01-01 00:00:00' >"$APP_DIR/db_backup.sql"
+        ;;
+    postgresql | timescaledb)
+        mkdir -p "$APP_DIR/pg_dump"
+        printf '%s\n' \
+            '-- PostgreSQL database cluster dump' \
+            '-- PostgreSQL database cluster dump complete' >"$APP_DIR/pg_dump/globals.sql"
+        printf '%s\n' \
+            '-- PostgreSQL database dump' \
+            'CREATE TABLE stale_from_previous_restore (id integer);' \
+            '-- PostgreSQL database dump complete' >"$APP_DIR/pg_dump/db-001.sql"
+        if [ "$DB_TYPE" = "timescaledb" ]; then
+            printf 'appdb\tappuser\t1\tdb-001.sql\t2.27.2\n' >"$APP_DIR/pg_dump/manifest.tsv"
+        else
+            printf 'appdb\tappuser\t0\tdb-001.sql\t\n' >"$APP_DIR/pg_dump/manifest.tsv"
+        fi
+        ;;
+    esac
+}
+
 write_sqlite_env() {
     cat >"$ENV_FILE" <<EOF
 BACKUP_SERVICE_ENABLED=false
 RESTORE_TEST_FLAG=$EXPECTED_ENV_FLAG
+# Keep the legacy five-slash URL here to verify existing installations.
 SQLALCHEMY_DATABASE_URL="sqlite:////$DATA_DIR/db.sqlite3"
 EOF
 }
@@ -260,7 +307,7 @@ write_timescaledb_compose() {
 $EXPECTED_COMPOSE_MARKER
 services:
   timescaledb:
-    image: timescale/timescaledb:latest-pg17
+    image: ${TIMESCALE_SOURCE_IMAGE:-timescale/timescaledb:latest-pg17}
 EOF
 }
 
@@ -275,10 +322,36 @@ record_original_file_hashes() {
 }
 
 setup_sqlite_db() {
-    sqlite3 "$DATA_DIR/db.sqlite3" <<EOF
-CREATE TABLE ci_roundtrip (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
-INSERT INTO ci_roundtrip (id, value) VALUES (1, '$EXPECTED_DB_VALUE');
-EOF
+    python3 - "$DATA_DIR/db.sqlite3" "$SQLITE_HOLDER_READY" "$SQLITE_HOLDER_STOP" "$EXPECTED_DB_VALUE" <<'PY' &
+import sqlite3
+import sys
+import time
+from pathlib import Path
+
+db_path, ready_path, stop_path, expected_value = sys.argv[1:]
+connection = sqlite3.connect(db_path)
+connection.execute("PRAGMA journal_mode=WAL")
+connection.execute("PRAGMA wal_autocheckpoint=0")
+connection.execute("CREATE TABLE ci_roundtrip (id INTEGER PRIMARY KEY, value TEXT NOT NULL)")
+connection.execute("INSERT INTO ci_roundtrip (id, value) VALUES (1, 'old-checkpoint')")
+connection.commit()
+connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+connection.execute("UPDATE ci_roundtrip SET value = ? WHERE id = 1", (expected_value,))
+connection.commit()
+Path(ready_path).touch()
+while not Path(stop_path).exists():
+    time.sleep(0.05)
+connection.close()
+PY
+    SQLITE_HOLDER_PID=$!
+    wait_for_command 50 test -f "$SQLITE_HOLDER_READY"
+
+    # A valid SQLite file with the same basename in APP_DIR used to overwrite
+    # the authoritative snapshot while app files were copied into staging.
+    # Keep this collision valid (not garbage) so integrity checks alone cannot
+    # distinguish it from the live DATA_DIR database.
+    sqlite3 "$APP_DIR/db.sqlite3" \
+        "CREATE TABLE ci_roundtrip (id INTEGER PRIMARY KEY, value TEXT NOT NULL); INSERT INTO ci_roundtrip VALUES (1, 'stale-app-dir-copy');"
 }
 
 sqlite_query() {
@@ -287,6 +360,7 @@ sqlite_query() {
 
 mutate_sqlite_db() {
     sqlite3 "$DATA_DIR/db.sqlite3" "UPDATE ci_roundtrip SET value = 'mutated' WHERE id = 1;"
+    printf 'stale rollback journal\n' >"$DATA_DIR/db.sqlite3-journal"
 }
 
 setup_mysql_container() {
@@ -299,7 +373,7 @@ setup_mysql_container() {
 
     wait_for_mysql_root_query mysql "$CONTAINER_NAME"
 
-    docker exec -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" "$CONTAINER_NAME" mysql -uroot -D "$DB_NAME" \
+    wait_for_command 30 docker exec -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" "$CONTAINER_NAME" mysql -uroot -D "$DB_NAME" \
         -e "CREATE TABLE ci_roundtrip (id INT PRIMARY KEY, value VARCHAR(255) NOT NULL); INSERT INTO ci_roundtrip (id, value) VALUES (1, '$EXPECTED_DB_VALUE');"
 }
 
@@ -313,7 +387,7 @@ setup_mariadb_container() {
 
     wait_for_mysql_root_query mariadb "$CONTAINER_NAME"
 
-    docker exec -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" "$CONTAINER_NAME" mariadb -uroot "$DB_NAME" \
+    wait_for_command 30 docker exec -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" "$CONTAINER_NAME" mariadb -uroot "$DB_NAME" \
         -e "CREATE TABLE ci_roundtrip (id INT PRIMARY KEY, value VARCHAR(255) NOT NULL); INSERT INTO ci_roundtrip (id, value) VALUES (1, '$EXPECTED_DB_VALUE');"
 }
 
@@ -339,29 +413,33 @@ mutate_mariadb_db() {
 
 setup_postgresql_container() {
     local image="$1"
+    local password="${2:-$DB_PASSWORD}"
+    local initial_value="${3:-$EXPECTED_DB_VALUE}"
     docker run -d --name "$CONTAINER_NAME" \
         -e POSTGRES_USER="$DB_USER" \
-        -e POSTGRES_PASSWORD="$DB_PASSWORD" \
+        -e POSTGRES_PASSWORD="$password" \
         -e POSTGRES_DB="$DB_NAME" \
+        -e POSTGRES_INITDB_ARGS="--auth-host=scram-sha-256" \
+        -e POSTGRES_HOST_AUTH_METHOD=scram-sha-256 \
         "$image" >/dev/null
 
-    wait_for_command 30 docker exec -e PGPASSWORD="$DB_PASSWORD" "$CONTAINER_NAME" \
+    wait_for_command 30 docker exec -e PGPASSWORD="$password" "$CONTAINER_NAME" \
         pg_isready -U "$DB_USER" -d "$DB_NAME"
 
     if [ "$DB_TYPE" = "timescaledb" ]; then
-        docker exec -e PGPASSWORD="$DB_PASSWORD" "$CONTAINER_NAME" \
+        wait_for_command 30 docker exec -e PGPASSWORD="$password" "$CONTAINER_NAME" \
             psql -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$DB_NAME" \
-            -c "CREATE EXTENSION IF NOT EXISTS timescaledb;"
+            -c "DO \$\$ BEGIN CREATE EXTENSION IF NOT EXISTS timescaledb; EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END \$\$;"
     fi
 
-    docker exec -e PGPASSWORD="$DB_PASSWORD" "$CONTAINER_NAME" \
+    wait_for_command 30 docker exec -e PGPASSWORD="$password" "$CONTAINER_NAME" \
         psql -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$DB_NAME" \
-        -c "CREATE TABLE ci_roundtrip (id INT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO ci_roundtrip (id, value) VALUES (1, '$EXPECTED_DB_VALUE');"
+        -c "CREATE TABLE ci_roundtrip (id INT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO ci_roundtrip (id, value) VALUES (1, '$initial_value');"
 }
 
 postgres_query() {
-    docker exec -e PGPASSWORD="$DB_PASSWORD" "$CONTAINER_NAME" \
-        psql -At -U "$DB_USER" -d "$DB_NAME" \
+    docker exec -e PGPASSWORD="$CURRENT_DB_PASSWORD" "$CONTAINER_NAME" \
+        psql -h 127.0.0.1 -At -U "$DB_USER" -d "$DB_NAME" \
         -c "SELECT value FROM ci_roundtrip WHERE id = 1;"
 }
 
@@ -372,14 +450,61 @@ mutate_postgres_db() {
 }
 
 mutate_files_after_backup() {
-    cat >"$ENV_FILE" <<EOF
+    if [ "$DB_TYPE" = "sqlite" ]; then
+        cat >"$ENV_FILE" <<EOF
 BACKUP_SERVICE_ENABLED=false
 RESTORE_TEST_FLAG=mutated-after-backup
 SQLALCHEMY_DATABASE_URL="sqlite:///mutated"
 EOF
-    printf '# compose-state: mutated-after-backup\n' >"$COMPOSE_FILE"
+    else
+        local scheme="$DB_TYPE"
+        [ "$DB_TYPE" = "timescaledb" ] && scheme="postgresql"
+        cat >"$ENV_FILE" <<EOF
+BACKUP_SERVICE_ENABLED=false
+RESTORE_TEST_FLAG=mutated-after-backup
+MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PASSWORD
+DB_USER=$DB_USER
+DB_PASSWORD=$CURRENT_DB_PASSWORD
+DB_NAME=$DB_NAME
+SQLALCHEMY_DATABASE_URL="$scheme://$DB_USER:$CURRENT_DB_PASSWORD@127.0.0.1:$([[ "$DB_TYPE" =~ ^(mysql|mariadb)$ ]] && echo 3306 || echo 5432)/$DB_NAME"
+EOF
+    fi
+    sed -i 's/^# compose-state: before-backup$/# compose-state: mutated-after-backup/' "$COMPOSE_FILE"
+    if [ "$DB_TYPE" = "timescaledb" ] && [ -n "${TIMESCALE_TARGET_IMAGE:-}" ]; then
+        sed -i "s#image: timescale/timescaledb:[^[:space:]]*#image: $TIMESCALE_TARGET_IMAGE#" "$COMPOSE_FILE"
+    fi
+    CURRENT_COMPOSE_SHA="$(sha256sum "$COMPOSE_FILE" | awk '{print $1}')"
     printf 'mutated-after-backup\n' >"$DATA_DIR/sentinel.txt"
     printf 'mutated-payload-%s\n' "$DB_TYPE" >"$DATA_DIR/payload.bin"
+}
+
+rotate_destination_credentials() {
+    case "$DB_TYPE" in
+    sqlite)
+        return 0
+        ;;
+    mysql)
+        docker exec -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" "$CONTAINER_NAME" mysql -uroot \
+            -e "ALTER USER '$DB_USER'@'%' IDENTIFIED BY '$CURRENT_DB_PASSWORD';"
+        ;;
+    mariadb)
+        docker exec -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" "$CONTAINER_NAME" mariadb -uroot \
+            -e "ALTER USER '$DB_USER'@'%' IDENTIFIED BY '$CURRENT_DB_PASSWORD';"
+        ;;
+    postgresql)
+        docker exec -e PGPASSWORD="$DB_PASSWORD" "$CONTAINER_NAME" psql -U "$DB_USER" -d postgres \
+            -c "ALTER ROLE \"$DB_USER\" PASSWORD '$CURRENT_DB_PASSWORD';"
+        ;;
+    timescaledb)
+        if [ -n "${TIMESCALE_TARGET_IMAGE:-}" ]; then
+            docker rm -f "$CONTAINER_NAME" >/dev/null
+            setup_postgresql_container "$TIMESCALE_TARGET_IMAGE" "$CURRENT_DB_PASSWORD" "mutated"
+        else
+            docker exec -e PGPASSWORD="$DB_PASSWORD" "$CONTAINER_NAME" psql -U "$DB_USER" -d postgres \
+                -c "ALTER ROLE \"$DB_USER\" PASSWORD '$CURRENT_DB_PASSWORD';"
+        fi
+        ;;
+    esac
 }
 
 run_restore() {
@@ -447,11 +572,7 @@ verify_backup_archive_contents() {
         expected_files=$'.env\ndb_backup.sql\ndocker-compose.yml\npasarguard_data/\npasarguard_data/payload.bin\npasarguard_data/sentinel.txt'
     fi
 
-    if [ "$DB_TYPE" = "sqlite" ]; then
-        assert_zip_contains_required_files "$archive_to_verify" "$expected_files"
-    else
-        assert_zip_contains_exact_files "$archive_to_verify" "$expected_files"
-    fi
+    assert_zip_contains_exact_files "$archive_to_verify" "$expected_files"
     assert_equals "$(sha256sum "$EXTRACTED_BACKUP_DIR/.env" | awk '{print $1}')" "$ORIGINAL_ENV_SHA" "Backed up .env contents changed."
     assert_equals "$(sha256sum "$EXTRACTED_BACKUP_DIR/docker-compose.yml" | awk '{print $1}')" "$ORIGINAL_COMPOSE_SHA" "Backed up docker-compose.yml contents changed."
     assert_equals "$(sha256sum "$EXTRACTED_BACKUP_DIR/pasarguard_data/sentinel.txt" | awk '{print $1}')" "$ORIGINAL_SENTINEL_SHA" "Backed up sentinel.txt contents changed."
@@ -460,9 +581,12 @@ verify_backup_archive_contents() {
     if [ "$DB_TYPE" = "sqlite" ]; then
         assert_sqlite_integrity "$EXTRACTED_BACKUP_DIR/$sqlite_basename"
         assert_equals "$(sqlite_dump_sha "$EXTRACTED_BACKUP_DIR/$sqlite_basename")" "$ORIGINAL_SQLITE_DUMP_SHA" "Backed up SQLite database logical contents changed."
-        if [ -f "$EXTRACTED_BACKUP_DIR/pasarguard_data/$sqlite_basename" ]; then
-            assert_sqlite_integrity "$EXTRACTED_BACKUP_DIR/pasarguard_data/$sqlite_basename"
-            assert_equals "$(sqlite_dump_sha "$EXTRACTED_BACKUP_DIR/pasarguard_data/$sqlite_basename")" "$ORIGINAL_SQLITE_DUMP_SHA" "Archived SQLite data-dir database logical contents changed."
+        if [ -e "$EXTRACTED_BACKUP_DIR/pasarguard_data/$sqlite_basename" ] || \
+            [ -e "$EXTRACTED_BACKUP_DIR/pasarguard_data/${sqlite_basename}-wal" ] || \
+            [ -e "$EXTRACTED_BACKUP_DIR/pasarguard_data/${sqlite_basename}-shm" ] || \
+            [ -e "$EXTRACTED_BACKUP_DIR/pasarguard_data/${sqlite_basename}-journal" ]; then
+            printf 'SQLite database or WAL/SHM/journal leaked into the raw data-directory copy.\n' >&2
+            exit 1
         fi
     elif [ "$DB_TYPE" = "postgresql" ] || [ "$DB_TYPE" = "timescaledb" ]; then
         assert_file_contains "$EXTRACTED_BACKUP_DIR/pg_dump/db-001.sql" "ci_roundtrip"
@@ -477,13 +601,36 @@ verify_restored_files() {
     restored_env_sha="$(sha256sum "$ENV_FILE" | awk '{print $1}')"
     restored_compose_sha="$(sha256sum "$COMPOSE_FILE" | awk '{print $1}')"
 
-    assert_equals "$restored_env_sha" "$ORIGINAL_ENV_SHA" ".env was not restored from backup."
-    assert_equals "$restored_compose_sha" "$ORIGINAL_COMPOSE_SHA" "docker-compose.yml was not restored from backup."
+    if [ "$DB_TYPE" = "sqlite" ]; then
+        assert_equals "$restored_env_sha" "$ORIGINAL_ENV_SHA" ".env was not restored from backup."
+        assert_equals "$restored_compose_sha" "$ORIGINAL_COMPOSE_SHA" "docker-compose.yml was not restored from backup."
+    else
+        assert_file_contains "$ENV_FILE" "RESTORE_TEST_FLAG=$EXPECTED_ENV_FLAG"
+        assert_file_contains "$ENV_FILE" "DB_USER=$DB_USER"
+        assert_file_contains "$ENV_FILE" "DB_PASSWORD=$CURRENT_DB_PASSWORD"
+        assert_file_contains "$ENV_FILE" "DB_NAME=$DB_NAME"
+        assert_file_contains "$ENV_FILE" "$DB_USER:$CURRENT_DB_PASSWORD@127.0.0.1"
+        assert_equals "$restored_compose_sha" "$CURRENT_COMPOSE_SHA" "Destination docker-compose.yml was replaced by the backup."
+    fi
     assert_equals "$(sha256sum "$DATA_DIR/sentinel.txt" | awk '{print $1}')" "$ORIGINAL_SENTINEL_SHA" "sentinel.txt was not restored from backup."
     assert_equals "$(sha256sum "$DATA_DIR/payload.bin" | awk '{print $1}')" "$ORIGINAL_PAYLOAD_SHA" "payload.bin was not restored from backup."
     if [ "$DB_TYPE" = "sqlite" ]; then
         assert_sqlite_integrity "$DATA_DIR/db.sqlite3"
         assert_equals "$(sqlite_dump_sha "$DATA_DIR/db.sqlite3")" "$ORIGINAL_SQLITE_DUMP_SHA" "SQLite database logical contents were not restored from backup."
+        if [ -e "$DATA_DIR/db.sqlite3-journal" ]; then
+            printf 'A stale SQLite rollback journal survived the restore.\n' >&2
+            exit 1
+        fi
+
+        local sqlite_safety_backup=""
+        sqlite_safety_backup=$(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'sqlite_before_restore_*_db.sqlite3' | sort | tail -n 1)
+        if [ -z "$sqlite_safety_backup" ]; then
+            printf 'The pre-restore SQLite safety snapshot did not survive the data-directory restore.\n' >&2
+            exit 1
+        fi
+        assert_sqlite_integrity "$sqlite_safety_backup"
+        assert_equals "$(sqlite3 "$sqlite_safety_backup" 'SELECT value FROM ci_roundtrip WHERE id = 1;')" \
+            "mutated" "Pre-restore SQLite safety snapshot did not preserve the replaced database."
     fi
 }
 
@@ -571,7 +718,7 @@ prepare_case() {
     timescaledb)
         write_postgres_env
         write_timescaledb_compose
-        setup_postgresql_container timescale/timescaledb:latest-pg17
+        setup_postgresql_container "${TIMESCALE_SOURCE_IMAGE:-timescale/timescaledb:latest-pg17}"
         ;;
     *)
         printf 'Unsupported database type: %s\n' "$DB_TYPE" >&2
@@ -579,6 +726,7 @@ prepare_case() {
         ;;
     esac
 
+    write_stale_database_artifacts
     record_original_file_hashes
 }
 
@@ -601,6 +749,32 @@ verify_restored_database() {
     esac
 
     assert_equals "$restored_value" "$EXPECTED_DB_VALUE" "Database value was not restored from backup."
+
+    case "$DB_TYPE" in
+    mysql)
+        docker exec -e MYSQL_PWD="$CURRENT_DB_PASSWORD" "$CONTAINER_NAME" mysql -h 127.0.0.1 -u "$DB_USER" "$DB_NAME" -e "SELECT 1;" >/dev/null
+        if docker exec -e MYSQL_PWD="$DB_PASSWORD" "$CONTAINER_NAME" mysql -h 127.0.0.1 -u "$DB_USER" "$DB_NAME" -e "SELECT 1;" >/dev/null 2>&1; then
+            printf 'Archived MySQL password still authenticates after restore.\n' >&2
+            exit 1
+        fi
+        ;;
+    mariadb)
+        docker exec -e MYSQL_PWD="$CURRENT_DB_PASSWORD" "$CONTAINER_NAME" mariadb -h 127.0.0.1 -u "$DB_USER" "$DB_NAME" -e "SELECT 1;" >/dev/null
+        if docker exec -e MYSQL_PWD="$DB_PASSWORD" "$CONTAINER_NAME" mariadb -h 127.0.0.1 -u "$DB_USER" "$DB_NAME" -e "SELECT 1;" >/dev/null 2>&1; then
+            printf 'Archived MariaDB password still authenticates after restore.\n' >&2
+            exit 1
+        fi
+        ;;
+    postgresql | timescaledb)
+        docker exec -e PGPASSWORD="$CURRENT_DB_PASSWORD" "$CONTAINER_NAME" \
+            psql -h 127.0.0.1 -At -U "$DB_USER" -d "$DB_NAME" -c "SELECT 1;" >/dev/null
+        if docker exec -e PGPASSWORD="$DB_PASSWORD" "$CONTAINER_NAME" \
+            psql -h 127.0.0.1 -At -U "$DB_USER" -d "$DB_NAME" -c "SELECT 1;" >/dev/null 2>&1; then
+            printf 'Archived PostgreSQL password still authenticates after restore.\n' >&2
+            exit 1
+        fi
+        ;;
+    esac
 }
 
 mutate_database_after_backup() {
@@ -631,7 +805,9 @@ main() {
     prepare_case
     backup_command
     verify_backup_created
+    stop_sqlite_holder
     mutate_database_after_backup
+    rotate_destination_credentials
     mutate_files_after_backup
     run_restore
     verify_restored_files
