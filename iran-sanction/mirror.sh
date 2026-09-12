@@ -36,7 +36,7 @@ APT_MIRRORS=(
 )
 
 APT_MIRRORS_UBUNTU=(
-    "http://ir.archive.ubuntu.com/ubuntu"
+    "https://ir.archive.ubuntu.com/ubuntu"
     "https://mirror.arvancloud.ir/ubuntu"
     "https://repo.hmirror.ir/ubuntu"
     "https://mirror.iranserver.com/ubuntu"
@@ -468,3 +468,8 @@ is_script_managed_apt_mirror() {
 
     return 1
 }
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    select_and_apply_apt_mirror
+    select_and_apply_docker_mirror
+fi

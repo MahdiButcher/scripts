@@ -164,22 +164,18 @@ Before altering the active database or overwriting files:
   /opt/pasarguard/backup/pasarguard_restore_error.log
   ```
 
-### TimescaleDB Cross-Version Migration Engine
+### TimescaleDB Version Compatibility & Safety Gate
 
-TimescaleDB stores hypertable metadata tightly coupled to its extension version. Attempting to restore a TimescaleDB 2.27 dump directly into a TimescaleDB 2.28 destination will fail because PostgreSQL prohibits updating extension schemas inside a dirty restore session.
+TimescaleDB hypertable metadata is tightly coupled to its extension version. Attempting to restore a TimescaleDB dump directly into an incompatible version will fail or risk corrupting hypertable catalogs.
 
-PasarGuard solves this automatically:
-1. **Metadata Inspection**: Reads the source extension version from `manifest.tsv` or the version sidecar file.
-2. **Compatibility Preflight**: Spins up a temporary compatibility container using `timescale/timescaledb-ha:pgNN-ts<version>-all` on an isolated volume.
-3. **Template0 Database Creation**: Creates a pristine staging database using `TEMPLATE template0` to avoid version lock.
-4. **Isolated Schema Upgrade**:
-   - Installs TimescaleDB at the source version.
-   - Calls `timescaledb_pre_restore()`.
-   - Restores table data.
-   - Calls `timescaledb_post_restore()`.
-   - Runs `ALTER EXTENSION timescaledb UPDATE TO '<target_version>'` in a clean backend session.
-5. **Target Import**: Dumps the upgraded database and imports it seamlessly into the live container.
-6. **Automatic Cleanup**: Tears down the temporary container and destroys its volume.
+PasarGuard handles TimescaleDB cross-version restore with strict fail-closed safety preflights:
+1. **Metadata Inspection**: Reads the source extension version from `manifest.tsv` or the version sidecar file (`db_backup.timescaledb-version`).
+2. **Version Compatibility Verification**: Probes the destination PostgreSQL instance for available `timescaledb` extension versions.
+3. **Automated Conversion Preflight**: When versions differ, PasarGuard attempts to stage and convert dumps using a temporary compatibility container (`timescale/timescaledb-ha:pgNN-ts<version>-all`) on an isolated volume before touching live databases.
+4. **Fail-Closed Safety Gate**: If the source and destination versions differ and cannot be safely converted (e.g. missing compatibility image, unverified versions, or conversion failure), PasarGuard **refuses to perform destructive changes**. The restore skips the incompatible database and exits with an error status:
+   - Existing databases and services remain completely untouched.
+   - Clear operator guidance is displayed with the exact required compatibility image and version strings.
+   - Detailed diagnostics are written to `/opt/pasarguard/backup/pasarguard_restore_error.log`.
 
 ### Troubleshooting Restore Failures
 

@@ -101,15 +101,20 @@
 
 ### 1. Installing PasarGuard Panel
 
-Run the single-line installer on your main server:
+Download and inspect the installer on your server (or pin to an immutable release tag):
 
 ```bash
+# Download installer script
+curl -fsSL https://raw.githubusercontent.com/PasarGuard/scripts/main/pasarguard.sh -o pasarguard.sh
+
 # Default install (SQLite, interactive SSL)
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/PasarGuard/scripts/main/pasarguard.sh)" @ install
+sudo bash pasarguard.sh install
 
 # High-concurrency production install (TimescaleDB + PgBouncer)
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/PasarGuard/scripts/main/pasarguard.sh)" @ install --database timescaledb --pre-release
+sudo bash pasarguard.sh install --database timescaledb --pre-release
 ```
+
+*(Tip: In production environments, review the script or pin to a specific release tag, e.g. `https://raw.githubusercontent.com/PasarGuard/scripts/<tag>/pasarguard.sh`).*
 
 Once installed, control the panel at any time using the global `pasarguard` command:
 ```bash
@@ -120,14 +125,17 @@ sudo pasarguard status
 
 ### 2. Installing a Worker Node
 
-On each remote worker node, execute the node installer:
+On each remote worker node, download and execute the node installer:
 
 ```bash
+# Download node installer script
+curl -fsSL https://raw.githubusercontent.com/PasarGuard/scripts/main/pg-node.sh -o pg-node.sh
+
 # Standard node installation
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/PasarGuard/scripts/main/pg-node.sh)" @ install
+sudo bash pg-node.sh install
 
 # Multi-instance node with custom name
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/PasarGuard/scripts/main/pg-node.sh)" @ install --name node-de1 --self-signed
+sudo bash pg-node.sh install --name node-de1 --self-signed
 ```
 
 Once installed, manage the node using the global `pg-node` command:
