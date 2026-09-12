@@ -5,7 +5,6 @@
 set -u
 
 TESTS_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd -- "${TESTS_DIR}/.." && pwd)"
 
 SUITES=(
     "unit_lib_common.sh"

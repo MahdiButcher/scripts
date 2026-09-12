@@ -159,6 +159,7 @@ describe_certificate "$SSL_CERT_FILE"
 log "TLS enabled on port $API_PORT with cert=$SSL_CERT_FILE key=$SSL_KEY_FILE"
 log "API key protection enabled"
 
+# Escape JSON special characters for HTTP response formatting.
 json_escape() {
   local s=$1
   s=${s//\\/\\\\}
@@ -168,6 +169,7 @@ json_escape() {
   echo -n "$s"
 }
 
+# Return standard HTTP status reason phrase for a status code.
 status_text() {
   case "$1" in
     200) echo -n "OK" ;;

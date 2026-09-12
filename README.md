@@ -41,7 +41,7 @@
 **PasarGuard Scripts** provides battle-tested automation for deploying and maintaining production-grade PasarGuard infrastructure:
 - **PasarGuard Panel (`pasarguard.sh` / `pasarguard`)**: Orchestrates the web dashboard, database engines (SQLite, MySQL, MariaDB, PostgreSQL, TimescaleDB), PgBouncer connection pooling, admin web UIs (pgAdmin, phpMyAdmin), and disaster recovery.
 - **PasarGuard Node (`pg-node.sh` / `pg-node`)**: Manages remote worker nodes, systemd background daemons (`pg-node-service`), Xray-core versions, routing geofiles, and TLS certificates.
-- **Disaster Recovery**: Automated recurring backups to Telegram with proxy support, atomic multi-database dumps, and automatic cross-version TimescaleDB upgrades.
+- **Disaster Recovery**: Automated recurring backups to Telegram with proxy support, multi-database cluster snapshots, and fail-closed TimescaleDB version compatibility gates.
 - **Domestic Mirror Optimization**: Benchmark and apply domestic Iranian mirrors for APT and Docker when deploying behind restricted network environments.
 
 ---
@@ -180,7 +180,7 @@ The following flags can be supplied to `pasarguard install`:
 | `pasarguard tui` | Opens curses-based Terminal User Interface (TUI). |
 | `pasarguard backup` | Immediate manual backup of database, configuration, and state. |
 | `pasarguard backup-service` | Configures automated recurring Telegram backups and cron schedule. |
-| `pasarguard restore` | Restores panel state and database with cross-version compatibility. |
+| `pasarguard restore` | Restores panel state and database with pre-restore validation and version compatibility gates. |
 | `pasarguard update` | Pulls latest Docker images and recreates containers cleanly. |
 | `pasarguard uninstall` | Removes containers, services, and optional application data directories. |
 | `pasarguard edit` | Opens `/opt/pasarguard/docker-compose.yml` in default editor. |
@@ -236,7 +236,7 @@ PasarGuard features an automated disaster recovery engine:
 1. **Atomic Dumps**: Creates consistent snapshots. SQLite WAL files are safely truncated, and PostgreSQL/TimescaleDB clusters are dumped with explicit table manifests and role permissions.
 2. **Scheduled Telegram Dispatch**: Configure recurring cron intervals (from 5 minutes to daily) using `pasarguard backup-service`. Backups are dispatched directly to your Telegram chat or channel.
 3. **Proxy Support**: Connect via SOCKS5 or HTTP proxy (`BACKUP_PROXY_URL`) to bypass Telegram network restrictions.
-4. **TimescaleDB Compatibility Migrations**: The restore engine automatically detects cross-version TimescaleDB archives and provisions isolated `template0` staging containers to upgrade hypertable schemas without version locks.
+4. **TimescaleDB Version Safety Preflight**: The restore engine validates source and destination TimescaleDB extension versions, enforcing a fail-closed safety gate that skips mismatched databases before modifying live data.
 5. **Fail-Safe Rollback**: Rejects truncated dumps and path traversal attacks before touching live data. If a restore encounters issues, diagnostics are logged to `/opt/pasarguard/backup/pasarguard_restore_error.log`.
 
 👉 *Read the disaster recovery runbook in [docs/backup-and-restore.md](docs/backup-and-restore.md).*

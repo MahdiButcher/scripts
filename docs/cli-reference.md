@@ -240,7 +240,7 @@ sudo pg-node logs
 ```
 
 #### `core-update`
-Updates or switches the underlying `Xray-core` binary using [install_core.sh](install_core.sh).
+Updates or switches the underlying `Xray-core` binary using [install_core.sh](../install_core.sh).
 - `--version <TAG>`: Specify release tag (e.g. `v1.8.24` or `latest`).
 ```bash
 sudo pg-node core-update --version latest

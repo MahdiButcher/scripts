@@ -19,7 +19,7 @@ Comprehensive guide to PasarGuard's backup architecture, automated Telegram back
 - [Disaster Recovery & Restore](#disaster-recovery--restore)
   - [Interactive Restore Flow](#interactive-restore-flow)
   - [Pre-Restore Safety Preflights](#pre-restore-safety-preflights)
-  - [TimescaleDB Cross-Version Migration Engine](#timescaledb-cross-version-migration-engine)
+  - [TimescaleDB Version Compatibility & Safety Gate](#timescaledb-version-compatibility--safety-gate)
   - [Troubleshooting Restore Failures](#troubleshooting-restore-failures)
 
 ---
