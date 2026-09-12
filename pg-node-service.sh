@@ -144,6 +144,16 @@ if ! command -v openssl >/dev/null 2>&1; then
 fi
 
 # Validate certificate
+cert_status=0
+check_certificate "$SSL_CERT_FILE" || cert_status=$?
+if [[ "$cert_status" -eq 1 ]]; then
+  if [[ "${ALLOW_INSECURE_TLS:-false}" != "true" ]]; then
+    log "Error: Certificate validation failed for $SSL_CERT_FILE. Refusing to start (set ALLOW_INSECURE_TLS=true to override)."
+    exit 1
+  else
+    log "Warning: Certificate validation failed for $SSL_CERT_FILE, but ALLOW_INSECURE_TLS=true is set. Continuing..."
+  fi
+fi
 describe_certificate "$SSL_CERT_FILE"
 
 log "TLS enabled on port $API_PORT with cert=$SSL_CERT_FILE key=$SSL_KEY_FILE"

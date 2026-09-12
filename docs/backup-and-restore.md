@@ -159,7 +159,7 @@ Before altering the active database or overwriting files:
 - **Archive Entry Inspection**: Guards against path traversal vulnerabilities (rejects archives with leading `/` or `../` entries).
 - **Dump Integrity Validation**: Verifies SQL dumps contain valid DDL/data and completed transaction markers.
 - **Compose Preservation**: Snapshots the destination's active `docker-compose.yml` so that port customizations or proxy bindings are not destroyed by the restored archive.
-- **Fail-Safe Rollback**: If validation fails at any stage, the existing database is left untouched, panel services are restarted, and detailed diagnostics are written to:
+- **Preflight Safety**: If archive validation fails during preflight inspection, existing databases and configuration files are left completely untouched, panel services are restarted, and detailed diagnostics are written to:
   ```
   /opt/pasarguard/backup/pasarguard_restore_error.log
   ```
@@ -168,14 +168,13 @@ Before altering the active database or overwriting files:
 
 TimescaleDB hypertable metadata is tightly coupled to its extension version. Attempting to restore a TimescaleDB dump directly into an incompatible version will fail or risk corrupting hypertable catalogs.
 
-PasarGuard handles TimescaleDB cross-version restore with strict fail-closed safety preflights:
+PasarGuard enforces a strict fail-closed safety gate:
 1. **Metadata Inspection**: Reads the source extension version from `manifest.tsv` or the version sidecar file (`db_backup.timescaledb-version`).
-2. **Version Compatibility Verification**: Probes the destination PostgreSQL instance for available `timescaledb` extension versions.
-3. **Automated Conversion Preflight**: When versions differ, PasarGuard attempts to stage and convert dumps using a temporary compatibility container (`timescale/timescaledb-ha:pgNN-ts<version>-all`) on an isolated volume before touching live databases.
-4. **Fail-Closed Safety Gate**: If the source and destination versions differ and cannot be safely converted (e.g. missing compatibility image, unverified versions, or conversion failure), PasarGuard **refuses to perform destructive changes**. The restore skips the incompatible database and exits with an error status:
-   - Existing databases and services remain completely untouched.
-   - Clear operator guidance is displayed with the exact required compatibility image and version strings.
-   - Detailed diagnostics are written to `/opt/pasarguard/backup/pasarguard_restore_error.log`.
+2. **Version Compatibility Verification**: Probes the destination PostgreSQL instance for the installed `timescaledb` extension version.
+3. **Fail-Closed Mismatch Handling**: When the archived TimescaleDB version differs from the destination server's installed version, PasarGuard skips restoring that database before executing destructive `DROP DATABASE` or recreate commands, and exits with a failure status.
+4. **Per-Database Rollback Boundary**: Databases listed in the backup manifest are restored sequentially. The no-change guarantee applies strictly to databases not yet reached or skipped; changes to earlier databases that have already been dropped and restored in the sequence are not rolled back if a subsequent database restore fails or is skipped.
+- Clear operator guidance is displayed with the source and target version strings.
+- Detailed diagnostics are written to `/opt/pasarguard/backup/pasarguard_restore_error.log`.
 
 ### Troubleshooting Restore Failures
 

@@ -729,14 +729,18 @@ assert_true "completion: contains script-version" contains "$comp_out" "script-v
 # -----------------------------------------------------------------------
 http_mirrors=$(grep -E '^[[:space:]]*"http://' "$ROOT_DIR/iran-sanction/mirror.sh" || true)
 assert_eq "$http_mirrors" "" "mirror.sh: no plaintext HTTP APT mirrors"
-mirror_entrypoint=$(grep -F 'BASH_SOURCE[0]' "$ROOT_DIR/iran-sanction/mirror.sh" || true)
-assert_true "mirror.sh: has BASH_SOURCE entrypoint guard" contains "$mirror_entrypoint" 'BASH_SOURCE[0]'
+assert_true "mirror.sh: has direct-execution guard" \
+    grep -Fq 'if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then' \
+    "$ROOT_DIR/iran-sanction/mirror.sh"
 
 # -----------------------------------------------------------------------
 # run_all.sh missing suite detection
 # -----------------------------------------------------------------------
-run_all_missing=$(grep -F 'FAILED_LIST+=("$suite (missing)")' "$ROOT_DIR/tests/run_all.sh" || true)
-assert_true "run_all.sh: records missing suites in FAILED_LIST" contains "$run_all_missing" 'FAILED_LIST'
+missing_branch=$(grep -A 3 -F 'Suite not found:' "$ROOT_DIR/tests/run_all.sh" || true)
+assert_true "run_all.sh: increments FAILED for missing suites" \
+    contains "$missing_branch" 'FAILED=$((FAILED + 1))'
+assert_true "run_all.sh: records missing suites in FAILED_LIST" \
+    contains "$missing_branch" 'FAILED_LIST+=("$suite (missing)")'
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

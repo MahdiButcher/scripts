@@ -117,7 +117,7 @@ sudo pasarguard backup-service
 ```
 
 #### `restore`
-Restores PasarGuard state from a previous backup archive (ZIP or tarball). Features pre-restore validation, atomic database replacements, and TimescaleDB version compatibility verification.
+Restores PasarGuard state from a previous backup archive (ZIP or tarball). Features pre-restore validation, sequential per-database restoration, and TimescaleDB version compatibility verification.
 ```bash
 sudo pasarguard restore
 ```

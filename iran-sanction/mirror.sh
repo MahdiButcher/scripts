@@ -470,6 +470,8 @@ is_script_managed_apt_mirror() {
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    select_and_apply_apt_mirror
-    select_and_apply_docker_mirror
+    status=0
+    select_and_apply_apt_mirror || status=1
+    select_and_apply_docker_mirror || status=1
+    exit "$status"
 fi
